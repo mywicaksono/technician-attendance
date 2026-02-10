@@ -1,11 +1,29 @@
--- CreateEnum
+-- Initial schema for technician attendance domain.
+-- Notes:
+-- 1) attendance_event is append-only ledger.
+-- 2) attendance_session is materialized mutable state for active/closed lookup.
+-- 3) idempotency is enforced by (technician_id, client_event_id).
+-- 4) QR anti-replay is enforced by (site_id, nonce).
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Enums
 CREATE TYPE "Role" AS ENUM ('TECHNICIAN', 'SUPERVISOR', 'ADMIN');
 CREATE TYPE "UserStatus" AS ENUM ('ACTIVE', 'DISABLED');
-CREATE TYPE "AttendanceType" AS ENUM ('CHECK_IN', 'CHECK_OUT');
-CREATE TYPE "RangeStatus" AS ENUM ('IN_RANGE', 'OUT_OF_RANGE');
+CREATE TYPE "EventType" AS ENUM ('CHECK_IN', 'CHECK_OUT');
+CREATE TYPE "SessionStatus" AS ENUM ('OPEN', 'CLOSED', 'OVERRIDDEN');
+CREATE TYPE "ValidationResult" AS ENUM (
+  'IN_RANGE',
+  'OUT_OF_RANGE',
+  'REJECTED_INVALID_QR',
+  'REJECTED_REPLAY',
+  'REJECTED_INVALID_SESSION',
+  'REJECTED_MISSING_SELFIE',
+  'REJECTED_OUT_OF_RANGE'
+);
 
--- CreateTable
-CREATE TABLE "User" (
+-- users
+CREATE TABLE "users" (
   "id" UUID NOT NULL DEFAULT gen_random_uuid(),
   "email" TEXT NOT NULL,
   "passwordHash" TEXT,
@@ -14,80 +32,189 @@ CREATE TABLE "User" (
   "status" "UserStatus" NOT NULL DEFAULT 'ACTIVE',
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-  CONSTRAINT "User_pkey" PRIMARY KEY ("id")
+  CONSTRAINT "users_pkey" PRIMARY KEY ("id")
 );
 
-CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
+CREATE UNIQUE INDEX "users_email_key" ON "users"("email");
+CREATE UNIQUE INDEX "users_ssoSubject_key" ON "users"("ssoSubject");
 
-CREATE TABLE "Site" (
+-- devices
+CREATE TABLE "devices" (
   "id" UUID NOT NULL DEFAULT gen_random_uuid(),
-  "name" TEXT NOT NULL,
-  "latitude" DOUBLE PRECISION NOT NULL,
-  "longitude" DOUBLE PRECISION NOT NULL,
-  "radiusMeters" INTEGER NOT NULL,
-  "qrRotationMinutes" INTEGER NOT NULL,
+  "technicianId" UUID NOT NULL,
+  "deviceUuid" TEXT NOT NULL,
+  "model" TEXT,
+  "osVersion" TEXT,
+  "appVersion" TEXT,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-  CONSTRAINT "Site_pkey" PRIMARY KEY ("id")
+  CONSTRAINT "devices_pkey" PRIMARY KEY ("id")
 );
 
-CREATE TABLE "SiteQrToken" (
+CREATE UNIQUE INDEX "devices_technicianId_deviceUuid_key" ON "devices"("technicianId", "deviceUuid");
+CREATE INDEX "devices_technicianId_updatedAt_idx" ON "devices"("technicianId", "updatedAt");
+
+-- sites
+CREATE TABLE "sites" (
   "id" UUID NOT NULL DEFAULT gen_random_uuid(),
-  "siteId" UUID NOT NULL,
-  "token" TEXT NOT NULL,
-  "expiresAt" TIMESTAMP(3) NOT NULL,
+  "code" TEXT NOT NULL,
+  "name" TEXT NOT NULL,
+  "latitude" DECIMAL(10,7) NOT NULL,
+  "longitude" DECIMAL(10,7) NOT NULL,
+  "radiusMeters" INTEGER NOT NULL,
+  "qrRotationMinutes" INTEGER NOT NULL,
+  "strictOutOfRange" BOOLEAN NOT NULL DEFAULT false,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-  CONSTRAINT "SiteQrToken_pkey" PRIMARY KEY ("id")
+  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "sites_pkey" PRIMARY KEY ("id")
 );
 
-CREATE UNIQUE INDEX "SiteQrToken_siteId_token_key" ON "SiteQrToken"("siteId", "token");
-CREATE INDEX "SiteQrToken_siteId_idx" ON "SiteQrToken"("siteId");
+CREATE UNIQUE INDEX "sites_code_key" ON "sites"("code");
+CREATE INDEX "sites_name_idx" ON "sites"("name");
 
-CREATE TABLE "AttendanceEvent" (
+-- attendance_event (append-only ledger)
+CREATE TABLE "attendance_event" (
   "id" UUID NOT NULL DEFAULT gen_random_uuid(),
   "technicianId" UUID NOT NULL,
   "siteId" UUID NOT NULL,
-  "type" "AttendanceType" NOT NULL,
-  "rangeStatus" "RangeStatus" NOT NULL,
-  "selfieUrl" TEXT NOT NULL,
-  "qrToken" TEXT,
-  "lat" DOUBLE PRECISION NOT NULL,
-  "lng" DOUBLE PRECISION NOT NULL,
-  "accuracy" DOUBLE PRECISION NOT NULL,
-  "deviceId" TEXT,
-  "deviceModel" TEXT,
-  "osVersion" TEXT,
-  "appVersion" TEXT,
-  "overrideNote" TEXT,
-  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-  CONSTRAINT "AttendanceEvent_pkey" PRIMARY KEY ("id")
+  "deviceId" UUID,
+  "clientEventId" TEXT NOT NULL,
+  "eventType" "EventType" NOT NULL,
+  "validationResult" "ValidationResult" NOT NULL,
+  "selfieObjectKey" TEXT NOT NULL,
+  "qrNonce" TEXT,
+  "qrIssuedAt" TIMESTAMP(3),
+  "qrExpiresAt" TIMESTAMP(3),
+  "lat" DECIMAL(10,7) NOT NULL,
+  "lng" DECIMAL(10,7) NOT NULL,
+  "accuracyMeters" DECIMAL(8,2) NOT NULL,
+  "eventAt" TIMESTAMP(3) NOT NULL,
+  "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "attendance_event_pkey" PRIMARY KEY ("id")
 );
 
-CREATE INDEX "AttendanceEvent_technicianId_createdAt_idx" ON "AttendanceEvent"("technicianId", "createdAt");
-CREATE INDEX "AttendanceEvent_siteId_createdAt_idx" ON "AttendanceEvent"("siteId", "createdAt");
+-- Idempotency invariant: dedupe retries per technician/client event.
+CREATE UNIQUE INDEX "attendance_event_technicianId_clientEventId_key"
+  ON "attendance_event"("technicianId", "clientEventId");
 
-CREATE TABLE "AuditLog" (
+-- Reporting indexes.
+CREATE INDEX "attendance_event_technicianId_receivedAt_idx"
+  ON "attendance_event"("technicianId", "receivedAt");
+CREATE INDEX "attendance_event_siteId_receivedAt_idx"
+  ON "attendance_event"("siteId", "receivedAt");
+CREATE INDEX "attendance_event_validationResult_receivedAt_idx"
+  ON "attendance_event"("validationResult", "receivedAt");
+CREATE INDEX "attendance_event_eventType_receivedAt_idx"
+  ON "attendance_event"("eventType", "receivedAt");
+
+-- attendance_session (materialized state)
+CREATE TABLE "attendance_session" (
   "id" UUID NOT NULL DEFAULT gen_random_uuid(),
-  "actorId" UUID NOT NULL,
+  "technicianId" UUID NOT NULL,
+  "siteId" UUID NOT NULL,
+  "checkInEventId" UUID NOT NULL,
+  "checkOutEventId" UUID,
+  "status" "SessionStatus" NOT NULL DEFAULT 'OPEN',
+  "startedAt" TIMESTAMP(3) NOT NULL,
+  "endedAt" TIMESTAMP(3),
+  "startedByUserId" UUID NOT NULL,
+  "endedByUserId" UUID,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "attendance_session_pkey" PRIMARY KEY ("id")
+);
+
+-- A ledger event can open/close at most one materialized session.
+CREATE UNIQUE INDEX "attendance_session_checkInEventId_key" ON "attendance_session"("checkInEventId");
+CREATE UNIQUE INDEX "attendance_session_checkOutEventId_key" ON "attendance_session"("checkOutEventId");
+
+-- Active session lookup + reporting.
+CREATE INDEX "attendance_session_technicianId_status_startedAt_idx"
+  ON "attendance_session"("technicianId", "status", "startedAt");
+CREATE INDEX "attendance_session_siteId_status_startedAt_idx"
+  ON "attendance_session"("siteId", "status", "startedAt");
+CREATE INDEX "attendance_session_status_updatedAt_idx"
+  ON "attendance_session"("status", "updatedAt");
+
+-- qr_payload_replay (nonce anti-replay tracking)
+CREATE TABLE "qr_payload_replay" (
+  "id" UUID NOT NULL DEFAULT gen_random_uuid(),
+  "siteId" UUID NOT NULL,
+  "nonce" TEXT NOT NULL,
+  "issuedAt" TIMESTAMP(3) NOT NULL,
+  "expiresAt" TIMESTAMP(3) NOT NULL,
+  "firstSeenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "acceptedEventId" UUID,
+  "seenByUserId" UUID,
+  CONSTRAINT "qr_payload_replay_pkey" PRIMARY KEY ("id")
+);
+
+-- Replay protection invariant.
+CREATE UNIQUE INDEX "qr_payload_replay_siteId_nonce_key" ON "qr_payload_replay"("siteId", "nonce");
+CREATE INDEX "qr_payload_replay_expiresAt_idx" ON "qr_payload_replay"("expiresAt");
+
+-- audit_log
+CREATE TABLE "audit_log" (
+  "id" UUID NOT NULL DEFAULT gen_random_uuid(),
+  "actorId" UUID,
   "action" TEXT NOT NULL,
-  "entity" TEXT NOT NULL,
+  "entityName" TEXT NOT NULL,
   "entityId" TEXT NOT NULL,
   "reason" TEXT,
   "metadata" JSONB,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-  CONSTRAINT "AuditLog_pkey" PRIMARY KEY ("id")
+  CONSTRAINT "audit_log_pkey" PRIMARY KEY ("id")
 );
 
-CREATE INDEX "AuditLog_entity_entityId_idx" ON "AuditLog"("entity", "entityId");
-CREATE INDEX "AuditLog_actorId_createdAt_idx" ON "AuditLog"("actorId", "createdAt");
+CREATE INDEX "audit_log_entityName_entityId_createdAt_idx"
+  ON "audit_log"("entityName", "entityId", "createdAt");
+CREATE INDEX "audit_log_actorId_createdAt_idx"
+  ON "audit_log"("actorId", "createdAt");
 
--- Foreign keys
-ALTER TABLE "SiteQrToken" ADD CONSTRAINT "SiteQrToken_siteId_fkey" FOREIGN KEY ("siteId") REFERENCES "Site"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-ALTER TABLE "AttendanceEvent" ADD CONSTRAINT "AttendanceEvent_technicianId_fkey" FOREIGN KEY ("technicianId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-ALTER TABLE "AttendanceEvent" ADD CONSTRAINT "AttendanceEvent_siteId_fkey" FOREIGN KEY ("siteId") REFERENCES "Site"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
-ALTER TABLE "AuditLog" ADD CONSTRAINT "AuditLog_actorId_fkey" FOREIGN KEY ("actorId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- Foreign keys (explicit)
+ALTER TABLE "devices"
+  ADD CONSTRAINT "devices_technicianId_fkey"
+  FOREIGN KEY ("technicianId") REFERENCES "users"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+ALTER TABLE "attendance_event"
+  ADD CONSTRAINT "attendance_event_technicianId_fkey"
+  FOREIGN KEY ("technicianId") REFERENCES "users"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "attendance_event"
+  ADD CONSTRAINT "attendance_event_siteId_fkey"
+  FOREIGN KEY ("siteId") REFERENCES "sites"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "attendance_event"
+  ADD CONSTRAINT "attendance_event_deviceId_fkey"
+  FOREIGN KEY ("deviceId") REFERENCES "devices"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+ALTER TABLE "attendance_session"
+  ADD CONSTRAINT "attendance_session_technicianId_fkey"
+  FOREIGN KEY ("technicianId") REFERENCES "users"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "attendance_session"
+  ADD CONSTRAINT "attendance_session_siteId_fkey"
+  FOREIGN KEY ("siteId") REFERENCES "sites"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "attendance_session"
+  ADD CONSTRAINT "attendance_session_checkInEventId_fkey"
+  FOREIGN KEY ("checkInEventId") REFERENCES "attendance_event"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "attendance_session"
+  ADD CONSTRAINT "attendance_session_checkOutEventId_fkey"
+  FOREIGN KEY ("checkOutEventId") REFERENCES "attendance_event"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "attendance_session"
+  ADD CONSTRAINT "attendance_session_startedByUserId_fkey"
+  FOREIGN KEY ("startedByUserId") REFERENCES "users"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "attendance_session"
+  ADD CONSTRAINT "attendance_session_endedByUserId_fkey"
+  FOREIGN KEY ("endedByUserId") REFERENCES "users"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+ALTER TABLE "qr_payload_replay"
+  ADD CONSTRAINT "qr_payload_replay_siteId_fkey"
+  FOREIGN KEY ("siteId") REFERENCES "sites"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "qr_payload_replay"
+  ADD CONSTRAINT "qr_payload_replay_acceptedEventId_fkey"
+  FOREIGN KEY ("acceptedEventId") REFERENCES "attendance_event"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "qr_payload_replay"
+  ADD CONSTRAINT "qr_payload_replay_seenByUserId_fkey"
+  FOREIGN KEY ("seenByUserId") REFERENCES "users"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+ALTER TABLE "audit_log"
+  ADD CONSTRAINT "audit_log_actorId_fkey"
+  FOREIGN KEY ("actorId") REFERENCES "users"("id") ON DELETE SET NULL ON UPDATE CASCADE;

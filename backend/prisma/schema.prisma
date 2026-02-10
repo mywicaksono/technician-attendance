@@ -7,105 +7,204 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// Role-based access control roles.
 enum Role {
   TECHNICIAN
   SUPERVISOR
   ADMIN
 }
 
+/// User account state.
 enum UserStatus {
   ACTIVE
   DISABLED
 }
 
-enum AttendanceType {
+/// Append-only attendance event type.
+enum EventType {
   CHECK_IN
   CHECK_OUT
 }
 
-enum RangeStatus {
+/// Materialized session lifecycle state.
+enum SessionStatus {
+  OPEN
+  CLOSED
+  OVERRIDDEN
+}
+
+/// Normalized validation outcome for audit/reporting.
+enum ValidationResult {
   IN_RANGE
   OUT_OF_RANGE
+  REJECTED_INVALID_QR
+  REJECTED_REPLAY
+  REJECTED_INVALID_SESSION
+  REJECTED_MISSING_SELFIE
+  REJECTED_OUT_OF_RANGE
 }
 
 model User {
   id           String     @id @default(uuid())
   email        String     @unique
   passwordHash String?
-  ssoSubject   String?
+  ssoSubject   String?    @unique
   role         Role
   status       UserStatus @default(ACTIVE)
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
+  /// One technician can register multiple client devices.
+  devices               Device[]
+  attendanceEvents      AttendanceEvent[]        @relation("AttendanceTechnician")
+  sessionsAsTechnician AttendanceSession[]      @relation("SessionTechnician")
+  sessionsStarted      AttendanceSession[]      @relation("SessionStartedByUser")
+  sessionsEnded        AttendanceSession[]      @relation("SessionEndedByUser")
+  auditLogs             AuditLog[]
+  qrPayloadReplayEvents QrPayloadReplay[]
+
+  @@map("users")
+}
+
+model Device {
+  id           String   @id @default(uuid())
+  technicianId String
+  deviceUuid   String
+  model        String?
+  osVersion    String?
+  appVersion   String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  technician       User              @relation(fields: [technicianId], references: [id])
   attendanceEvents AttendanceEvent[]
-  auditLogs        AuditLog[]
+
+  @@unique([technicianId, deviceUuid])
+  @@index([technicianId, updatedAt])
+  @@map("devices")
 }
 
 model Site {
-  id                 String         @id @default(uuid())
+  id                 String   @id @default(uuid())
+  code               String   @unique
   name               String
-  latitude           Float
-  longitude          Float
+  latitude           Decimal  @db.Decimal(10, 7)
+  longitude          Decimal  @db.Decimal(10, 7)
   radiusMeters       Int
   qrRotationMinutes  Int
-  createdAt          DateTime       @default(now())
-  updatedAt          DateTime       @updatedAt
+  strictOutOfRange   Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
-  qrTokens          SiteQrToken[]
   attendanceEvents  AttendanceEvent[]
-}
+  attendanceSession AttendanceSession[]
+  qrPayloadReplays  QrPayloadReplay[]
 
-model SiteQrToken {
-  id        String   @id @default(uuid())
-  siteId    String
-  token     String
-  expiresAt DateTime
-  createdAt DateTime @default(now())
-
-  site Site @relation(fields: [siteId], references: [id])
-
-  @@index([siteId])
-  @@unique([siteId, token])
+  @@index([name])
+  @@map("sites")
 }
 
 model AttendanceEvent {
-  id           String         @id @default(uuid())
-  technicianId String
-  siteId       String
-  type         AttendanceType
-  rangeStatus  RangeStatus
-  selfieUrl    String
-  qrToken      String?
-  lat          Float
-  lng          Float
-  accuracy     Float
-  deviceId     String?
-  deviceModel  String?
-  osVersion    String?
-  appVersion   String?
-  overrideNote String?
-  createdAt    DateTime       @default(now())
+  id               String           @id @default(uuid())
+  technicianId     String
+  siteId           String
+  deviceId         String?
+  /// Client-generated UUID for idempotent retries.
+  clientEventId    String
+  eventType        EventType
+  validationResult ValidationResult
+  selfieObjectKey  String
+  qrNonce          String?
+  qrIssuedAt       DateTime?
+  qrExpiresAt      DateTime?
+  lat              Decimal          @db.Decimal(10, 7)
+  lng              Decimal          @db.Decimal(10, 7)
+  accuracyMeters   Decimal          @db.Decimal(8, 2)
+  eventAt          DateTime
+  receivedAt       DateTime         @default(now())
 
-  technician User @relation(fields: [technicianId], references: [id])
-  site       Site @relation(fields: [siteId], references: [id])
+  technician User               @relation("AttendanceTechnician", fields: [technicianId], references: [id])
+  site       Site               @relation(fields: [siteId], references: [id])
+  device     Device?            @relation(fields: [deviceId], references: [id])
+  sessionsAsCheckIn  AttendanceSession[] @relation("SessionCheckInEvent")
+  sessionsAsCheckOut AttendanceSession[] @relation("SessionCheckOutEvent")
+  acceptedQrReplays  QrPayloadReplay[]  @relation("ReplayAcceptedEvent")
 
-  @@index([technicianId, createdAt])
-  @@index([siteId, createdAt])
+  /// Enforces idempotency per technician.
+  @@unique([technicianId, clientEventId])
+  /// Reporting indexes.
+  @@index([technicianId, receivedAt])
+  @@index([siteId, receivedAt])
+  @@index([validationResult, receivedAt])
+  @@index([eventType, receivedAt])
+  @@map("attendance_event")
+}
+
+model AttendanceSession {
+  id               String        @id @default(uuid())
+  technicianId     String
+  siteId           String
+  checkInEventId   String
+  checkOutEventId  String?
+  status           SessionStatus @default(OPEN)
+  startedAt        DateTime
+  endedAt          DateTime?
+  startedByUserId  String
+  endedByUserId    String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  technician   User            @relation("SessionTechnician", fields: [technicianId], references: [id])
+  site         Site            @relation(fields: [siteId], references: [id])
+  checkInEvent AttendanceEvent @relation("SessionCheckInEvent", fields: [checkInEventId], references: [id])
+  checkOutEvent AttendanceEvent? @relation("SessionCheckOutEvent", fields: [checkOutEventId], references: [id])
+  startedBy    User            @relation("SessionStartedByUser", fields: [startedByUserId], references: [id])
+  endedBy      User?           @relation("SessionEndedByUser", fields: [endedByUserId], references: [id])
+
+  /// One event can only open one materialized session.
+  @@unique([checkInEventId])
+  /// One check-out event can only close one materialized session.
+  @@unique([checkOutEventId])
+  /// Active session lookup and reporting.
+  @@index([technicianId, status, startedAt])
+  @@index([siteId, status, startedAt])
+  @@index([status, updatedAt])
+  @@map("attendance_session")
+}
+
+model QrPayloadReplay {
+  id            String   @id @default(uuid())
+  siteId        String
+  nonce         String
+  issuedAt      DateTime
+  expiresAt     DateTime
+  firstSeenAt   DateTime @default(now())
+  acceptedEventId String?
+  seenByUserId  String?
+
+  site          Site              @relation(fields: [siteId], references: [id])
+  acceptedEvent AttendanceEvent?  @relation("ReplayAcceptedEvent", fields: [acceptedEventId], references: [id])
+  seenByUser    User?             @relation(fields: [seenByUserId], references: [id])
+
+  /// Anti-replay protection for signed QR payloads.
+  @@unique([siteId, nonce])
+  @@index([expiresAt])
+  @@map("qr_payload_replay")
 }
 
 model AuditLog {
-  id        String   @id @default(uuid())
-  actorId   String
-  action    String
-  entity    String
-  entityId  String
-  reason    String?
-  metadata  Json?
-  createdAt DateTime @default(now())
+  id          String   @id @default(uuid())
+  actorId     String?
+  action      String
+  entityName  String
+  entityId    String
+  reason      String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
 
-  actor User @relation(fields: [actorId], references: [id])
+  actor User? @relation(fields: [actorId], references: [id])
 
-  @@index([entity, entityId])
+  @@index([entityName, entityId, createdAt])
   @@index([actorId, createdAt])
+  @@map("audit_log")
 }
