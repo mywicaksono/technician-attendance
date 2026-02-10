@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { AttendanceType, RangeStatus } from '@prisma/client';
+import { EventType, RangeStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma.service';
 import { CheckInDto } from './dto/check-in.dto';
 import { CheckOutDto } from './dto/check-out.dto';
@@ -30,7 +30,7 @@ export class AttendanceService {
         data: {
           technicianId,
           siteId: payload.siteId,
-          type: AttendanceType.CHECK_IN,
+          eventType: EventType.CHECK_IN,
           rangeStatus,
           selfieUrl: payload.selfieUrl,
           qrToken: payload.qrToken,
@@ -69,7 +69,7 @@ export class AttendanceService {
       orderBy: { createdAt: 'desc' },
     });
 
-    if (!lastEvent || lastEvent.type !== AttendanceType.CHECK_IN) {
+    if (!lastEvent || lastEvent.eventType !== EventType.CHECK_IN) {
       throw new BadRequestException('No active check-in');
     }
 
@@ -80,7 +80,7 @@ export class AttendanceService {
         data: {
           technicianId,
           siteId: payload.siteId,
-          type: AttendanceType.CHECK_OUT,
+          eventType: EventType.CHECK_OUT,
           rangeStatus,
           selfieUrl: payload.selfieUrl,
           lat: payload.gps.lat,
@@ -112,7 +112,7 @@ export class AttendanceService {
       where: { technicianId },
       orderBy: { createdAt: 'desc' },
     });
-    if (lastEvent && lastEvent.type === AttendanceType.CHECK_IN) {
+    if (lastEvent && lastEvent.eventType === EventType.CHECK_IN) {
       throw new BadRequestException('Active check-in already exists');
     }
   }
