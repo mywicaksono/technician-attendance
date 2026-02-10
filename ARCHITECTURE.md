@@ -24,9 +24,10 @@ The system is designed for strong auditability, offline-first operation on Andro
    - Submit attendance payload with selfie URL.
 4. Backend validates:
    - No active check-in without check-out.
-   - GPS within site radius.
-   - QR token valid and unexpired.
+   - GPS within site radius (or apply configured out-of-range policy).
+   - QR payload signature + expiration + anti-replay constraints.
    - Selfie metadata present.
+   - Idempotency key uniqueness for retries.
 5. Backend stores attendance event and emits audit log.
 
 ### Check-out (Android)
@@ -34,16 +35,21 @@ Same as check-in, but without QR.
 
 ## Domain Model (Explicit)
 ### attendance_event
-- Immutable, append-only record for each check-in or check-out.
+- Immutable, append-only ledger record for each check-in or check-out.
 - References: `attendance_session`, `site`, `device`, and `audit_log` (via audited actions).
+- Required fields include:
+  - `client_event_id` (UUID from Android client, generated once per event)
+  - `validation_result` (`IN_RANGE`, `OUT_OF_RANGE`, `REJECTED_*`)
 - Invariants:
   - `selfie` is mandatory for every event.
-  - `CHECK_IN` must include a valid `qr_token`.
+  - `CHECK_IN` must include a valid QR payload.
   - `CHECK_OUT` must reference an open `attendance_session`.
+  - Server deduplicates retries by unique key: `(technician_id, client_event_id)`.
 
 ### attendance_session
-- Represents the active work session between a check-in and its corresponding check-out.
+- Represents technician attendance state between check-in and check-out.
 - References: `technician`, `site`, and the `attendance_event` pair (start/end).
+- **State model decision**: `attendance_session` is a mutable/materialized state view derived from immutable `attendance_event` records. It may update fields such as `ended_at` and `status` (`OPEN`, `CLOSED`, `OVERRIDDEN`) for efficient querying, while the event ledger remains the source of truth.
 - Invariants:
   - At most one open session per technician at any time.
   - Session start must be a valid `CHECK_IN` event.
@@ -57,49 +63,71 @@ Same as check-in, but without QR.
   - No hard delete; records are immutable.
 
 ### site
-- Physical location with geofence radius.
-- References: `qr_token` rotation configuration and associated `attendance_event` records.
+- Physical location with geofence radius and optional policy controls.
+- References: QR signing configuration and associated `attendance_event` records.
 - Invariants:
   - `radius_meters` must be positive.
   - Latitude/longitude must be valid coordinates.
+  - Optional policy `out_of_range_policy` controls whether `OUT_OF_RANGE` is accepted-with-flag (default) or rejected.
 
-### qr_token
-- Site-scoped rotating token used for check-in verification.
-- References: `site`.
+### qr_token (signed QR payload)
+- Site-scoped signed payload used for check-in verification.
+- Logical payload fields: `site_id`, `issued_at`, `expires_at`, `nonce`, `signature`.
+- References: `site` and server-side replay tracking.
 - Invariants:
-  - Only one active token per site at a time.
-  - Tokens are short-lived and expire automatically.
+  - Signature must verify against server-managed key.
+  - `issued_at <= now <= expires_at` (within allowed skew window).
+  - `nonce` must pass replay protection checks.
 
 ### device
 - Captures client device metadata for each attendance event.
 - References: attached to `attendance_event`.
 - Invariants:
-  - `device_id` + `app_version` must be captured when available.
+  - `device_id` + `app_version` should be captured when available.
+
+## Idempotency and Retry Safety
+- Every attendance submission from Android includes `client_event_id` (UUID).
+- Android must reuse the same `client_event_id` when retrying the same queued event.
+- Backend enforces uniqueness on `(technician_id, client_event_id)` and returns the existing canonical result for duplicates.
+- This prevents duplicate check-in/check-out events during offline retries, network timeouts, and app restarts.
 
 ## QR Token Lifecycle
-- **Rotation strategy**: Each site has a configurable rotation interval (minutes). A new token is generated at rotation boundaries and immediately replaces the prior active token.
-- **Expiration rules**: Tokens expire after the rotation interval plus a small grace period (e.g., 1–2 minutes) to account for clock skew. Expired tokens are rejected server-side.
-- **Offline scan handling**: Android may cache the latest token for a site to allow scanning without network. Cached tokens must still be validated by the server at sync time; if expired, the check-in is rejected with a reason indicating QR expiration.
+- **Approach decision**: Prefer signed QR payloads over plain rotating tokens to support offline scan capture and deferred server verification.
+- **Rotation strategy**: Each site has a configurable rotation interval (minutes). A new signed QR payload is generated at rotation boundaries.
+- **Expiration rules**: Signed payloads expire at `expires_at` with small clock-skew tolerance (e.g., 1–2 minutes).
+- **Offline scan handling**: Android can scan and store payload offline; acceptance is deferred until server sync verifies signature, validity window, and replay status.
+- **Server verification**:
+  - Verify cryptographic signature.
+  - Validate `site_id`, `issued_at`, `expires_at` window.
+  - Enforce anti-replay.
+- **Anti-replay options**:
+  - Nonce tracking store (`site_id + nonce` uniqueness during validity window), or
+  - Windowed replay protection that marks nonce as consumed once accepted and blocks reuse within/after the window.
 
 ## Offline Conflict Resolution Rules
 - **Server vs client responsibility**:
-  - Server is the source of truth for timestamps, session state, and QR validity.
-  - Client is responsible for accurate capture of GPS/selfie/device metadata and for reliable queueing.
+  - Server is the source of truth for timestamps, session state, idempotency dedupe, QR validity, replay checks, and final validation outcome.
+  - Client is responsible for accurate capture of GPS/selfie/device metadata and reliable queueing.
+- **Out-of-range policy**:
+  - Default: attendance is accepted but flagged with `validation_result = OUT_OF_RANGE`.
+  - Optional per-site strict mode may reject out-of-range attendance (`validation_result = REJECTED_OUT_OF_RANGE`).
 - **Rejection scenarios** (non-exhaustive):
-  - Check-in with expired/invalid QR token.
+  - Check-in with expired/invalid signature QR payload.
+  - Check-in replay attempt with used nonce.
   - Check-in when an open `attendance_session` already exists.
   - Check-out without a matching open session.
   - Missing selfie or corrupted selfie upload.
-  - GPS outside site radius (accepted but marked `OUT_OF_RANGE`).
+  - Payload violates schema or required constraints.
 
 ## Android Offline Security
 - **Local encryption strategy**:
   - Encrypt selfies at rest using per-device keys stored in Android Keystore.
-  - Use AES-GCM for file encryption; store only encrypted blobs in app storage.
+  - Use AES-GCM for file encryption; store only encrypted blobs in app-private storage.
+  - Keep queued metadata in Room; avoid storing plaintext selfie bytes in database rows.
 - **Selfie retention & cleanup policy**:
   - Retain selfies locally only until upload succeeds and server acknowledges the attendance event.
-  - On successful sync, securely delete local encrypted files and clear cached metadata.
-  - On rejection, retain for a limited time (e.g., 7 days) to allow re-sync or support review, then purge.
+  - On successful sync, securely delete local encrypted files and clear related metadata pointers.
+  - On rejection, retain for a limited time (e.g., 7 days) for re-sync/support review, then purge automatically.
 
 ## Security
 - **Auth**: Email/password + OIDC SSO, JWT access/refresh.
@@ -108,7 +136,7 @@ Same as check-in, but without QR.
 - **Audit**: All state changes are recorded with actor, timestamp, and reason.
 
 ## Storage
-- **PostgreSQL**: Attendance records, users, sites, QR tokens, audit logs.
+- **PostgreSQL**: Attendance records, users, sites, QR payload replay state, audit logs.
 - **S3-compatible**: Selfie images; stored encrypted at rest.
 
 ## Timezone
