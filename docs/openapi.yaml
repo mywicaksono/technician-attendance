@@ -1,0 +1,243 @@
+openapi: 3.0.3
+info:
+  title: Technician Attendance API
+  version: 1.0.0
+servers:
+  - url: https://api.example.com
+paths:
+  /auth/login:
+    post:
+      summary: Login with email/password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Tokens
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokens'
+  /auth/refresh:
+    post:
+      summary: Refresh JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Tokens
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokens'
+  /attendance/check-in:
+    post:
+      summary: Create a check-in event
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckInRequest'
+      responses:
+        '201':
+          description: Attendance event
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceEvent'
+  /attendance/check-out:
+    post:
+      summary: Create a check-out event
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckOutRequest'
+      responses:
+        '201':
+          description: Attendance event
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttendanceEvent'
+  /sites:
+    get:
+      summary: List sites
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Sites
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Site'
+  /uploads/selfie:
+    post:
+      summary: Request a selfie upload URL
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Pre-signed upload URL and constraints
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelfieUpload'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+    AuthTokens:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        expiresIn:
+          type: integer
+    CheckInRequest:
+      type: object
+      required: [siteId, qrToken, selfieUrl, gps]
+      properties:
+        siteId:
+          type: string
+        qrToken:
+          type: string
+        selfieUrl:
+          type: string
+        gps:
+          $ref: '#/components/schemas/GpsPayload'
+        device:
+          $ref: '#/components/schemas/DevicePayload'
+    CheckOutRequest:
+      type: object
+      required: [siteId, selfieUrl, gps]
+      properties:
+        siteId:
+          type: string
+        selfieUrl:
+          type: string
+        gps:
+          $ref: '#/components/schemas/GpsPayload'
+        device:
+          $ref: '#/components/schemas/DevicePayload'
+    GpsPayload:
+      type: object
+      required: [lat, lng, accuracy]
+      properties:
+        lat:
+          type: number
+          format: float
+        lng:
+          type: number
+          format: float
+        accuracy:
+          type: number
+          format: float
+    DevicePayload:
+      type: object
+      properties:
+        deviceId:
+          type: string
+        model:
+          type: string
+        osVersion:
+          type: string
+        appVersion:
+          type: string
+    AttendanceEvent:
+      type: object
+      properties:
+        id:
+          type: string
+        technicianId:
+          type: string
+        siteId:
+          type: string
+        type:
+          type: string
+          enum: [CHECK_IN, CHECK_OUT]
+        status:
+          type: string
+          enum: [IN_RANGE, OUT_OF_RANGE]
+        selfieUrl:
+          type: string
+        gps:
+          $ref: '#/components/schemas/GpsPayload'
+        createdAt:
+          type: string
+          format: date-time
+    Site:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        latitude:
+          type: number
+        longitude:
+          type: number
+        radiusMeters:
+          type: integer
+    SelfieUpload:
+      type: object
+      properties:
+        uploadUrl:
+          type: string
+        maxSizeBytes:
+          type: integer
+        allowedMimeTypes:
+          type: array
+          items:
+            type: string
+        minResolution:
+          type: object
+          properties:
+            width:
+              type: integer
+            height:
+              type: integer
+        maxResolution:
+          type: object
+          properties:
+            width:
+              type: integer
+            height:
+              type: integer
