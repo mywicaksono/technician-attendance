@@ -1,0 +1,111 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  TECHNICIAN
+  SUPERVISOR
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum AttendanceType {
+  CHECK_IN
+  CHECK_OUT
+}
+
+enum RangeStatus {
+  IN_RANGE
+  OUT_OF_RANGE
+}
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String?
+  ssoSubject   String?
+  role         Role
+  status       UserStatus @default(ACTIVE)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  attendanceEvents AttendanceEvent[]
+  auditLogs        AuditLog[]
+}
+
+model Site {
+  id                 String         @id @default(uuid())
+  name               String
+  latitude           Float
+  longitude          Float
+  radiusMeters       Int
+  qrRotationMinutes  Int
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  qrTokens          SiteQrToken[]
+  attendanceEvents  AttendanceEvent[]
+}
+
+model SiteQrToken {
+  id        String   @id @default(uuid())
+  siteId    String
+  token     String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  site Site @relation(fields: [siteId], references: [id])
+
+  @@index([siteId])
+  @@unique([siteId, token])
+}
+
+model AttendanceEvent {
+  id           String         @id @default(uuid())
+  technicianId String
+  siteId       String
+  type         AttendanceType
+  rangeStatus  RangeStatus
+  selfieUrl    String
+  qrToken      String?
+  lat          Float
+  lng          Float
+  accuracy     Float
+  deviceId     String?
+  deviceModel  String?
+  osVersion    String?
+  appVersion   String?
+  overrideNote String?
+  createdAt    DateTime       @default(now())
+
+  technician User @relation(fields: [technicianId], references: [id])
+  site       Site @relation(fields: [siteId], references: [id])
+
+  @@index([technicianId, createdAt])
+  @@index([siteId, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  actorId   String
+  action    String
+  entity    String
+  entityId  String
+  reason    String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  actor User @relation(fields: [actorId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([actorId, createdAt])
+}
