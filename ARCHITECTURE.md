@@ -32,6 +32,75 @@ The system is designed for strong auditability, offline-first operation on Andro
 ### Check-out (Android)
 Same as check-in, but without QR.
 
+## Domain Model (Explicit)
+### attendance_event
+- Immutable, append-only record for each check-in or check-out.
+- References: `attendance_session`, `site`, `device`, and `audit_log` (via audited actions).
+- Invariants:
+  - `selfie` is mandatory for every event.
+  - `CHECK_IN` must include a valid `qr_token`.
+  - `CHECK_OUT` must reference an open `attendance_session`.
+
+### attendance_session
+- Represents the active work session between a check-in and its corresponding check-out.
+- References: `technician`, `site`, and the `attendance_event` pair (start/end).
+- Invariants:
+  - At most one open session per technician at any time.
+  - Session start must be a valid `CHECK_IN` event.
+  - Session end must be a valid `CHECK_OUT` event.
+
+### audit_log
+- Append-only ledger for all privileged actions and mutations.
+- References: `actor` (user), `entity`, and `entity_id`.
+- Invariants:
+  - Every manual override requires a non-empty reason.
+  - No hard delete; records are immutable.
+
+### site
+- Physical location with geofence radius.
+- References: `qr_token` rotation configuration and associated `attendance_event` records.
+- Invariants:
+  - `radius_meters` must be positive.
+  - Latitude/longitude must be valid coordinates.
+
+### qr_token
+- Site-scoped rotating token used for check-in verification.
+- References: `site`.
+- Invariants:
+  - Only one active token per site at a time.
+  - Tokens are short-lived and expire automatically.
+
+### device
+- Captures client device metadata for each attendance event.
+- References: attached to `attendance_event`.
+- Invariants:
+  - `device_id` + `app_version` must be captured when available.
+
+## QR Token Lifecycle
+- **Rotation strategy**: Each site has a configurable rotation interval (minutes). A new token is generated at rotation boundaries and immediately replaces the prior active token.
+- **Expiration rules**: Tokens expire after the rotation interval plus a small grace period (e.g., 1–2 minutes) to account for clock skew. Expired tokens are rejected server-side.
+- **Offline scan handling**: Android may cache the latest token for a site to allow scanning without network. Cached tokens must still be validated by the server at sync time; if expired, the check-in is rejected with a reason indicating QR expiration.
+
+## Offline Conflict Resolution Rules
+- **Server vs client responsibility**:
+  - Server is the source of truth for timestamps, session state, and QR validity.
+  - Client is responsible for accurate capture of GPS/selfie/device metadata and for reliable queueing.
+- **Rejection scenarios** (non-exhaustive):
+  - Check-in with expired/invalid QR token.
+  - Check-in when an open `attendance_session` already exists.
+  - Check-out without a matching open session.
+  - Missing selfie or corrupted selfie upload.
+  - GPS outside site radius (accepted but marked `OUT_OF_RANGE`).
+
+## Android Offline Security
+- **Local encryption strategy**:
+  - Encrypt selfies at rest using per-device keys stored in Android Keystore.
+  - Use AES-GCM for file encryption; store only encrypted blobs in app storage.
+- **Selfie retention & cleanup policy**:
+  - Retain selfies locally only until upload succeeds and server acknowledges the attendance event.
+  - On successful sync, securely delete local encrypted files and clear cached metadata.
+  - On rejection, retain for a limited time (e.g., 7 days) to allow re-sync or support review, then purge.
+
 ## Security
 - **Auth**: Email/password + OIDC SSO, JWT access/refresh.
 - **RBAC**: `TECHNICIAN`, `SUPERVISOR`, `ADMIN`.
