@@ -1,7 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { AttendanceService } from './attendance.service';
 import { PrismaService } from '../common/prisma.service';
-import { AttendanceType } from '@prisma/client';
+import { EventType } from '@prisma/client';
 
 const prismaMock = {
   site: {
@@ -34,7 +34,7 @@ describe('AttendanceService', () => {
       radiusMeters: 100,
     });
     prismaMock.siteQrToken.findFirst.mockResolvedValue({ id: 'token-1' });
-    prismaMock.attendanceEvent.findFirst.mockResolvedValue({ type: AttendanceType.CHECK_IN });
+    prismaMock.attendanceEvent.findFirst.mockResolvedValue({ eventType: EventType.CHECK_IN });
 
     await expect(
       service.checkIn('tech-1', {

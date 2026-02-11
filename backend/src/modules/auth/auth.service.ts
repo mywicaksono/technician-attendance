@@ -7,7 +7,7 @@ import { UsersRepository } from './repositories/users.repository';
 import { AppException } from '../../common/app.exception';
 import { ErrorCode } from '../../common/error-codes';
 
-interface Tokens {
+export interface Tokens {
   accessToken: string;
   refreshToken: string;
   expiresIn: number;
