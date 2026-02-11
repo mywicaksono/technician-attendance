@@ -1,12 +1,14 @@
 import { Type } from 'class-transformer';
-import { IsNotEmpty, IsString, ValidateNested } from 'class-validator';
+import { IsDateString, IsNotEmpty, IsOptional, IsString, IsUUID, ValidateNested } from 'class-validator';
 import { DeviceDto } from './device.dto';
 import { GpsDto } from './gps.dto';
 
 export class CheckInDto {
-  @IsString()
-  @IsNotEmpty()
+  @IsUUID()
   siteId!: string;
+
+  @IsUUID()
+  clientEventId!: string;
 
   @IsString()
   @IsNotEmpty()
@@ -14,7 +16,14 @@ export class CheckInDto {
 
   @IsString()
   @IsNotEmpty()
-  selfieUrl!: string;
+  selfieObjectKey!: string;
+
+  @IsOptional()
+  @IsString()
+  selfieUrl?: string;
+
+  @IsDateString()
+  capturedAtClient!: string;
 
   @ValidateNested()
   @Type(() => GpsDto)
